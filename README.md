@@ -9,21 +9,23 @@
 
 ```
 src/lilt_ocr/
-  labels.py   # 26 플랫 라벨 + id2label/label2id
-  data.py     # labeld.json 폴더들 → HF Dataset (0~1000 정규화, 토큰-라벨 정렬)
-  train.py    # 모델 구성 + Trainer + 체크포인트 + metric (진입점)
-data/         # 라벨된 문서 폴더들 (gitignore) — 각 폴더에 labeld.json + cleaned.png
+  labels.py     # 26 플랫 라벨 + id2label/label2id
+  dataloader.py # label.json 폴더들 → HF Dataset (0~1000 정규화, 토큰-라벨 정렬)
+  train.py      # 모델 구성 + Trainer + 체크포인트 + metric (진입점)
+data/         # 라벨된 문서 폴더들 (gitignore) — train/ val/ 하위 각 폴더에 label.json (image_width/image_height 포함, 이미지 불필요)
 checkpoints/  # 학습 산출물 (gitignore) — 런별 타임스탬프 폴더
 ```
 
 ## 데이터 준비
 
-`ocr_labeler`로 라벨링한 각 문서 폴더(`labeld.json` + `cleaned.png`)를 `data/` 아래에 복사
-(또는 심볼릭 링크)한다. `data.py`가 재귀 탐색으로 `labeld.json`을 찾는다.
+라벨링한 각 문서 폴더(`label.json`)를 `data/train/` 또는 `data/val/` 아래에 둔다.
+`label.json`은 `{image_path, image_width, image_height, annotations}` 형태로, 크기가 들어 있어
+이미지 파일은 필요 없다. `dataloader.py`가 `data/train`·`data/val`을 재귀 탐색해 split을 나눈다.
 
-```bash
-# 예: tax_invoice/output 의 라벨된 폴더들을 data/ 로
-cp -R /Users/user/Desktop/projects/tax_invoice/output/* data/
+```
+data/
+  train/{회사명}/label.json
+  val/{회사명}/label.json
 ```
 
 ## 설치 · 학습

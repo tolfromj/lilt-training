@@ -1,48 +1,34 @@
-"""라벨된 문서 폴더(labeld.json + 이미지) → HF Dataset.
+"""라벨된 문서 폴더(label.json) → HF Dataset (dataloader).
 
-라벨러(ocr_labeler)가 저장하는 labeld.json 은 OcrBox 배열이며, 각 박스는
-{index, bbox:[x1,y1,x2,y2] (픽셀), text, conf, cell?, tag?} 형태다.
-bbox 가 픽셀 좌표라 LiLT 입력용 0~1000 정규화를 위해 같은 폴더의 이미지에서
-W,H 를 읽는다. 정규화·word_ids 정렬은 추론 코드(tsl-lilt-xlmroberta.py)와 동일 공식.
+각 문서의 label.json 은 {image_path, image_width, image_height, annotations} 객체이며,
+annotations 는 OcrBox 배열({index, bbox:[x1,y1,x2,y2] (픽셀), text, conf, cell?, tag?}) 이다.
+bbox 가 픽셀 좌표라 LiLT 입력용 0~1000 정규화를 위해 JSON 의 image_width/image_height 를
+쓴다(이미지 파일 불필요). 정규화·word_ids 정렬은 추론 코드(tsl-lilt-xlmroberta.py)와 동일 공식.
 """
 
 import json
 from pathlib import Path
 
 from datasets import Dataset
-from PIL import Image
 
 from .labels import label2id
 
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
-
-def find_docs(data_dir: str) -> list[Path]:
-    """data_dir 재귀 탐색 → labeld.json 이 있는 폴더 목록."""
+def find_docs(data_dir) -> list[Path]:
+    """data_dir 재귀 탐색 → label.json 이 있는 폴더 목록."""
     root = Path(data_dir)
-    return sorted(p.parent for p in root.rglob("labeld.json"))
-
-
-def _find_image(doc_dir: Path) -> Path:
-    """폴더 내 cleaned.png 우선, 없으면 첫 이미지 파일."""
-    cleaned = doc_dir / "cleaned.png"
-    if cleaned.exists():
-        return cleaned
-    for p in sorted(doc_dir.iterdir()):
-        if p.suffix.lower() in IMG_EXTS:
-            return p
-    raise FileNotFoundError(f"이미지 없음(bbox 정규화 불가): {doc_dir}")
+    return sorted(p.parent for p in root.rglob("label.json"))
 
 
 def load_doc(doc_dir: Path) -> dict:
     """한 문서 → {tokens, bboxes(0~1000), ner_tags(id)}."""
-    with open(doc_dir / "labeld.json", encoding="utf-8") as f:
-        boxes = json.load(f)
+    with open(doc_dir / "label.json", encoding="utf-8") as f:
+        data = json.load(f)
 
-    W, H = Image.open(_find_image(doc_dir)).size
+    W, H = data["image_width"], data["image_height"]
 
     tokens, bboxes, ner_tags = [], [], []
-    for b in boxes:
+    for b in data["annotations"]:
         text = (b.get("text") or "").strip()
         if not text:
             continue
@@ -61,24 +47,29 @@ def load_doc(doc_dir: Path) -> dict:
     return {"tokens": tokens, "bboxes": bboxes, "ner_tags": ner_tags}
 
 
-def build_dataset(data_dir: str, val_ratio: float = 0.2, seed: int = 42):
-    """모든 문서 로드 → train/val 로 분할된 DatasetDict."""
-    docs = find_docs(data_dir)
-    if not docs:
-        raise FileNotFoundError(
-            f"'{data_dir}' 아래에 labeld.json 이 하나도 없습니다. "
-            f"ocr_labeler 로 라벨링한 문서 폴더를 data/ 에 두세요."
-        )
-
-    records = [load_doc(d) for d in docs]
+def _load_split(split_dir: Path) -> Dataset:
+    """한 split 폴더(train/ or val/) 아래 모든 문서 → HF Dataset."""
+    records = [load_doc(d) for d in find_docs(split_dir)]
     records = [r for r in records if r["tokens"]]  # 빈 문서 제외
-    ds = Dataset.from_list(records)
+    return Dataset.from_list(records)
 
-    if len(ds) < 2:
-        # 분할 불가 — 같은 데이터를 train/val 로 사용(스모크 테스트용).
-        return {"train": ds, "validation": ds}
-    split = ds.train_test_split(test_size=val_ratio, seed=seed)
-    return {"train": split["train"], "validation": split["test"]}
+
+def build_dataloader(data_dir: str = "data"):
+    """폴더 기준 split: data/train → train, data/val → validation 인 DatasetDict."""
+    root = Path(data_dir)
+    train_ds = _load_split(root / "train")
+    val_ds = _load_split(root / "val")
+
+    if len(train_ds) == 0:
+        raise FileNotFoundError(
+            f"'{root / 'train'}' 아래에 label.json 이 하나도 없습니다. "
+            f"라벨링한 문서 폴더를 data/train/ 에 두세요."
+        )
+    if len(val_ds) == 0:
+        # val 없음 — train 을 val 로 재사용(스모크 테스트용).
+        val_ds = train_ds
+
+    return {"train": train_ds, "validation": val_ds}
 
 
 def tokenize_and_align(examples: dict, tokenizer, max_length: int = 512) -> dict:

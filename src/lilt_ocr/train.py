@@ -29,7 +29,7 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 
-from .data import build_dataset, tokenize_and_align
+from .dataloader import build_dataloader, tokenize_and_align
 from .labels import NUM_LABELS, id2label, label2id
 
 BASE = "nielsr/lilt-xlm-roberta-base"
@@ -53,12 +53,11 @@ def compute_metrics(eval_pred):
 
 def main():
     ap = argparse.ArgumentParser(description="LiLT head 파인튜닝 (세금계산서 KIE)")
-    ap.add_argument("--data-dir", default="data", help="labeld.json 문서 폴더들의 루트")
+    ap.add_argument("--data-dir", default="data", help="train/ val/ 하위에 label.json 문서 폴더들의 루트")
     ap.add_argument("--output-dir", default="checkpoints", help="체크포인트 루트")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=5e-5)
-    ap.add_argument("--val-ratio", type=float, default=0.2)
     ap.add_argument("--max-length", type=int, default=512)
     ap.add_argument("--resume", default=None,
                     help="이어서 학습할 런 폴더(예: checkpoints/20260706-143022)")
@@ -82,7 +81,7 @@ def main():
         BASE, num_labels=NUM_LABELS, id2label=id2label, label2id=label2id,
     )
 
-    ds = build_dataset(args.data_dir, val_ratio=args.val_ratio)
+    ds = build_dataloader(args.data_dir)
     tok_fn = partial(tokenize_and_align, tokenizer=tokenizer, max_length=args.max_length)
     ds = {
         split: d.map(tok_fn, batched=True, remove_columns=d.column_names)
