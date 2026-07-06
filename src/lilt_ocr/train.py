@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max-length", type=int, default=512)
+    ap.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=True,
+                    help="백본 동결 후 분류 head 만 학습 (소량 데이터 권장). --no-freeze-backbone 로 풀 파인튜닝")
     ap.add_argument("--resume", default=None,
                     help="이어서 학습할 런 폴더(예: checkpoints/20260706-143022)")
     args = ap.parse_args()
@@ -80,6 +82,14 @@ def main():
     model = AutoModelForTokenClassification.from_pretrained(
         BASE, num_labels=NUM_LABELS, id2label=id2label, label2id=label2id,
     )
+
+    # 소량 데이터(≈15문서) 과적합 방지: 백본 동결, 분류 head 만 학습.
+    if args.freeze_backbone:
+        for p in model.base_model.parameters():
+            p.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"[freeze] 백본 동결 — 학습 파라미터 {trainable:,}/{total:,}")
 
     ds = build_dataloader(args.data_dir)
     tok_fn = partial(tokenize_and_align, tokenizer=tokenizer, max_length=args.max_length)
