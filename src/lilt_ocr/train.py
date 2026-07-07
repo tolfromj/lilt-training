@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import classification_report, f1_score, accuracy_score
 from transformers import (
     AutoModelForTokenClassification,
@@ -33,6 +34,58 @@ from .dataloader import build_dataloader, tokenize_and_align
 from .labels import NUM_LABELS, id2label, label2id
 
 BASE = "nielsr/lilt-xlm-roberta-base"
+
+
+def compute_class_weights(dataset, num_labels: int, clip: float = 10.0) -> torch.Tensor:
+    """토큰-정렬된 train 라벨(-100 제외) 빈도 역수 → 클래스 가중치.
+
+    KEY(56%) 같은 다수 클래스의 gradient 지배를 완화. mean≈1 로 정규화 후
+    상한 clip 으로 초희소 클래스(토큰 1~2개)의 폭주 가중치를 자름.
+    """
+    counts = np.zeros(num_labels, dtype=np.float64)
+    for labels in dataset["labels"]:
+        for lid in labels:
+            if lid != -100:
+                counts[int(lid)] += 1
+    counts = np.maximum(counts, 1.0)          # 미등장 클래스도 0 division 방지
+    freq = counts / counts.sum()
+    w = 1.0 / freq
+    w = w / w.mean()                          # 평균 1 근처로 스케일
+    w = np.minimum(w, clip)                   # 초희소 클래스 상한
+    return torch.tensor(w, dtype=torch.float32)
+
+
+class FocalTrainer(Trainer):
+    """클래스 가중 focal loss 로 compute_loss 를 대체한 Trainer.
+
+    focal = (1 - pt)^gamma * (-alpha_c * log p_c). gamma=0 이면 순수 가중 CE.
+    -100 은 손실에서 제외(토큰 첫조각만 학습).
+    """
+
+    def __init__(self, *args, class_weights=None, focal_gamma: float = 2.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+        self.focal_gamma = focal_gamma
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits                       # (B, T, C)
+        C = logits.size(-1)
+        logits = logits.reshape(-1, C)
+        labels = labels.reshape(-1)
+
+        mask = labels != -100
+        logits = logits[mask]
+        labels = labels[mask]
+
+        w = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        log_probs = F.log_softmax(logits, dim=-1)
+        ce = F.nll_loss(log_probs, labels, weight=w, reduction="none")   # 가중치 포함
+        pt = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1).exp()   # focal 변조는 비가중 pt
+        loss = ((1.0 - pt) ** self.focal_gamma * ce).mean()
+
+        return (loss, outputs) if return_outputs else loss
 
 
 def compute_metrics(eval_pred):
@@ -57,10 +110,16 @@ def main():
     ap.add_argument("--output-dir", default="checkpoints", help="체크포인트 루트")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch-size", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--lr", type=float, default=3e-5)
     ap.add_argument("--max-length", type=int, default=512)
-    ap.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=True,
-                    help="백본 동결 후 분류 head 만 학습 (소량 데이터 권장). --no-freeze-backbone 로 풀 파인튜닝")
+    ap.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=False,
+                    help="백본 동결 후 분류 head 만 학습. 기본은 풀 파인튜닝(불균형/희소 클래스 구분에 유리)")
+    ap.add_argument("--focal-gamma", type=float, default=2.0,
+                    help="focal loss 감마. 0 이면 순수 클래스 가중 CE, 클수록 쉬운(다수) 토큰 손실을 더 눌러줌")
+    ap.add_argument("--weight-clip", type=float, default=10.0,
+                    help="클래스 가중치 상한. 초희소 클래스의 폭주 가중치를 자름")
+    ap.add_argument("--no-class-weights", dest="class_weights", action="store_false", default=True,
+                    help="클래스 가중치 비활성(가중치 없는 focal loss)")
     ap.add_argument("--resume", default=None,
                     help="이어서 학습할 런 폴더(예: checkpoints/20260706-143022)")
     args = ap.parse_args()
@@ -83,7 +142,7 @@ def main():
         BASE, num_labels=NUM_LABELS, id2label=id2label, label2id=label2id,
     )
 
-    # 소량 데이터(≈15문서) 과적합 방지: 백본 동결, 분류 head 만 학습.
+    # --freeze-backbone 지정 시에만 백본 동결. 기본은 풀 파인튜닝(세밀 클래스 구분에 필요).
     if args.freeze_backbone:
         for p in model.base_model.parameters():
             p.requires_grad = False
@@ -99,12 +158,22 @@ def main():
     }
     print(f"[data] train={len(ds['train'])} val={len(ds['validation'])}")
 
+    # KEY 편향(다수 클래스 붕괴) 완화: 빈도 역수 클래스 가중치.
+    class_weights = None
+    if args.class_weights:
+        class_weights = compute_class_weights(ds["train"], NUM_LABELS, clip=args.weight_clip)
+        top = sorted(enumerate(class_weights.tolist()), key=lambda kv: kv[1])
+        print(f"[weights] focal_gamma={args.focal_gamma} clip={args.weight_clip} "
+              f"min={id2label[top[0][0]]}:{top[0][1]:.2f} max={id2label[top[-1][0]]}:{top[-1][1]:.2f}")
+
     training_args = TrainingArguments(
         output_dir=str(run_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.lr,
+        warmup_ratio=0.1,                    # 풀 파인튜닝 초기 발산 방지
+        weight_decay=0.01,
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=None,               # 중간 체크포인트 전부 보존(덮어쓰기 없음)
@@ -116,13 +185,15 @@ def main():
         report_to="none",
     )
 
-    trainer = Trainer(
+    trainer = FocalTrainer(
         model=model,
         args=training_args,
         train_dataset=ds["train"],
         eval_dataset=ds["validation"],
         data_collator=default_data_collator,
         compute_metrics=compute_metrics,
+        class_weights=class_weights,
+        focal_gamma=args.focal_gamma,
     )
 
     trainer.train(resume_from_checkpoint=ckpt)
