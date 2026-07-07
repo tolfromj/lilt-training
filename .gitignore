@@ -12,3 +12,4 @@ wheels/
 # Training data & checkpoints
 data/
 checkpoints/
+data.zip
